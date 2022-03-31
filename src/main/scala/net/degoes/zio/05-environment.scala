@@ -1,6 +1,35 @@
 package net.degoes.zio
 
+import zio.clock.Clock
 import zio._
+import zio.console.Console.Service
+
+object LazyLayer extends App {
+  import zio.console._
+
+  /**
+   * Here we are creating two potentially lazy layers
+   * lazyIntBoomLayer is a Has[Int] Layer that when it is materialized it should throw a NotImplementedError
+   * lazyStringLayer is a Has[String] Layer that materializes the value "Hello World"
+   * lazyEnvironment is a set of services that are meant to be used by many apps (a'la ZEenv) but not all apps
+   * require all services, so they should be materialized in a lazy fashion
+   */
+  lazy val int = ???
+  val lazyStringLayer: ULayer[Has[String]] = ZLayer.succeed[String]("Hello World")
+  val lazyIntBoomLayer: ULayer[Has[UIO[Int]]] = ZLayer.succeed(ZIO.effect(int).orDie)
+  val lazyEnvironment: ZLayer[Any, Nothing, Has[UIO[Int]] with Has[String]] = lazyIntBoomLayer ++ lazyStringLayer
+
+  val greet =
+    for {
+      string <- ZIO.environment[Has[String]].map(_.get)
+//      int <- ZIO.environment[Has[UIO[Int]]].flatMap(_.get)
+      int = 0
+      _ <- putStrLn(s"$string $int")
+    } yield ()
+
+  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
+    greet.provideSomeLayer[Console](lazyEnvironment).exitCode
+}
 
 object AccessEnvironment extends App {
   import zio.console._
@@ -13,7 +42,7 @@ object AccessEnvironment extends App {
    * Using `ZIO.access`, access a `Config` type from the environment, and
    * extract the `server` field from it.
    */
-  val accessServer: ZIO[Config, Nothing, String] = ???
+  val accessServer: ZIO[Config, Nothing, String] = ZIO.access(_.server)
 
   /**
    * EXERCISE
@@ -21,7 +50,7 @@ object AccessEnvironment extends App {
    * Using `ZIO.access`, access a `Config` type from the environment, and
    * extract the `port` field from it.
    */
-  val accessPort: ZIO[Config, Nothing, Int] = ???
+  val accessPort: ZIO[Config, Nothing, Int] = ZIO.access(_.port)
 
   def run(args: List[String]) = {
     val config = Config("localhost", 7878)
@@ -59,8 +88,9 @@ object ProvideEnvironment extends App {
    */
   def run(args: List[String]) = {
     val config = Config("localhost", 7878)
+    val connection = DatabaseConnection()
 
-    ???
+    (getServer.provide(config) *> useDatabaseConnection.provide(connection)).exitCode
   }
 }
 
@@ -89,7 +119,7 @@ object CakeEnvironment extends App {
     def read(file: String) = ZIO.accessM[Files](_.files.read(file))
   }
 
-  val effect =
+  val effect: ZIO[Logging with Files, IOException, Unit] =
     for {
       file <- Files.read("build.sbt")
       _    <- Logging.log(file)
@@ -102,10 +132,20 @@ object CakeEnvironment extends App {
    * have to build a value (the environment) of the required type
    * (`Files with Logging`).
    */
-  def run(args: List[String]) =
+  def run(args: List[String]) = {
+    val logWithFiles = new Logging with Files {
+      override val logging: Logging.Service = new Logging.Service {
+        override def log(line: String): UIO[Unit] = UIO(println(line))
+      }
+      override val files: Files.Service = new Files.Service {
+        override def read(file: String): IO[IOException, String] =
+          IO.effect(scala.io.Source.fromFile(file).mkString).refineToOrDie[IOException]
+      }
+    }
     effect
-      .provide(???)
+      .provide(logWithFiles)
       .exitCode
+  }
 }
 
 /**
@@ -136,7 +176,7 @@ object HasMap extends App {
    * Using the `++` operator on `Has`, combine the three maps (`hasLogging`, `hasDatabase`, and
    * `hasCache`) into a single map that has all three objects.
    */
-  val allThree: Has[Database] with Has[Cache] with Has[Logging] = ???
+  val allThree: Has[Database] with Has[Cache] with Has[Logging] = hasLogging ++ hasDatabase ++ hasCache
 
   /**
    * EXERCISE
@@ -146,11 +186,12 @@ object HasMap extends App {
    * parameter, as it cannot be inferred (the map needs to know which of the objects you want to
    * retrieve, and that can be specified only by type).
    */
-  lazy val logging  = ???
-  lazy val database = ???
-  lazy val cache    = ???
+  lazy val logging  = allThree.get[Logging]
+  lazy val database = allThree.get[Database]
+  lazy val cache    = allThree.get[Cache]
 
-  def run(args: List[String]) = ???
+  def run(args: List[String]) =
+    ZIO.unit.exitCode
 }
 
 /**
@@ -187,7 +228,11 @@ object LayerEnvironment extends App {
      * Using `ZLayer.succeed`, create a layer that implements the `Files`
      * service.
      */
-    val live: ZLayer[Blocking, Nothing, Files] = ???
+    val live: ZLayer[Blocking, Nothing, Files] = ZLayer.fromFunction[Blocking, Files.Service](blocking =>
+      (file: String) => {
+        ZIO.accessM[Blocking](_.get.effectBlockingIO(scala.io.Source.fromFile(file).mkString)).provide(blocking)
+      }
+    )
 
     def read(file: String) = ZIO.accessM[Files](_.get.read(file))
   }
@@ -204,7 +249,9 @@ object LayerEnvironment extends App {
      * Using `ZLayer.fromFunction`, create a layer that requires `Console`
      * and uses the console to provide a logging service.
      */
-    val live: ZLayer[Console, Nothing, Logging] = ???
+    val live: ZLayer[Console, Nothing, Logging] = ZLayer.fromFunction((console: Console) =>
+      (line: String) => zio.console.putStrLn(line).provide(console)
+    )
 
     def log(line: String) = ZIO.accessM[Logging](_.get.log(line))
   }
@@ -224,11 +271,59 @@ object LayerEnvironment extends App {
      * You will have to build a value (the environment) of the required type
      * (`Files with Logging`).
      */
-    val env: ZLayer[Console, Nothing, Files with Logging] =
-      ???
+    val env: ZLayer[Console with Blocking, Nothing, Files with Logging] =
+      Files.live ++ Logging.live
 
-    effect
+    val env2: ZLayer[Any, Nothing, Files with Logging] =
+      (Console.live ++ Blocking.live) >>> (Files.live ++ Logging.live)
+
+    val env2bis: ZLayer[Console, Nothing, Files with Logging] =
+      (Console.any ++ Blocking.live) >>> (Files.live ++ Logging.live)
+
+    val env3: ZLayer[Any, Nothing, Files with Logging with Console with Logging] =
+      (Console.live ++ Blocking.live) >+> (Files.live ++ Logging.live)
+
+    val env4: ZLayer[Blocking with Console, Nothing, Files with Logging] =
+      Files.live ++ Logging.live
+
+    val env5: ZLayer[Blocking with Console, Nothing, (Files, Logging)] =
+      Files.live <&> Logging.live
+
+    val missingConsole: ZLayer[Any, Throwable, Console] =
+      ZLayer.fromEffect(ZIO.effect(???))
+
+    val prependedConsole: ZLayer[Any, Throwable, Console] =
+      ZLayer.succeed(
+        new Console.Service {
+          override def putStrLn(line: String): UIO[Unit] = UIO.succeed(println(s"PREPENDED $line"))
+
+          override def putStr(line: String): UIO[Unit] = ???
+
+          override def putStrErr(line: String): UIO[Unit] = ???
+
+          override def putStrLnErr(line: String): UIO[Unit] = ???
+
+          override def getStrLn: IO[IOException, String] = ???
+        }
+      )
+
+    val env6: ZLayer[Any, Throwable, Console] =
+      prependedConsole ++ Console.live
+
+    val env7: ZLayer[Any, Throwable, Console] =
+      prependedConsole +!+ Console.live
+
+    val env8: ZLayer[Any, Throwable, Console] =
+      missingConsole <> Console.live
+
+    val env9: ZLayer[Any, Nothing, Files with Logging] =
+      ((missingConsole <> Console.live) ++ Blocking.live) >>> (Files.live ++ Logging.live)
+
+
+    val x = putStrLn("HOLA").provideLayer(prependedConsole).orDie
+    x *> (effect
       .provideCustomLayer(env)
-      .exitCode
-  }
+      .exitCode)
+    }
+
 }

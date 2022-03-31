@@ -1,11 +1,48 @@
 package net.degoes.zio
 
 import zio._
+import zio.clock.Clock
+
+import scala.annotation.tailrec
+import scala.collection.AbstractSeq
+
+object QueueRace extends App {
+  import zio._
+  import zio.console._
+
+  val queueCount = 10
+  val queueIterator: Seq[Int] = (1 to queueCount)
+
+  def takeAndPrint(queue: Queue[Int]): URIO[Console, Int] =
+    queue.take.tap(num => printWithFiber("In race", num))
+
+  def printWithFiber(status: String, num: Int): URIO[Console, Unit] =
+    putStrLn(s"[$status] Took $num")
+
+  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
+    (for {
+      queues: Seq[Queue[Int]] <- ZIO.foreachPar(queueIterator){ num =>
+        // Create a queue and offer a single number
+        Queue.unbounded[Int].tap(_.offer(num))
+      }
+      nums: Seq[Int] <- ZIO.foreachPar(queueIterator){_ =>
+        // Take
+        ZIO.raceAll(takeAndPrint(queues.head), queues.tail.map(takeAndPrint)).tap(num => printWithFiber("Race done", num))
+      }
+      // It never prints this as it just hangs because all queues are empty
+      // TODO Fix that
+      _ <- putStrLn(nums.toString)
+    } yield ()).exitCode
+}
 
 object ForkJoin extends App {
   import zio.console._
 
-  val printer =
+  val lazyIntLayer: ULayer[Has[Int]] = ZLayer.suspend(ZLayer.succeed[Int](???))
+  val lazyStringLayer: ULayer[Has[String]] = ZLayer.suspend(ZLayer.succeed[String]("Hola"))
+  val lazyLayer: ZLayer[Any, Nothing, Has[Int] with Has[String]] = lazyIntLayer ++ lazyStringLayer
+
+  val printer: ZIO[Has[String] with Console with Clock, Nothing, Long] =
     putStrLn(".").repeat(Schedule.recurs(10))
 
   /**
@@ -16,14 +53,19 @@ object ForkJoin extends App {
    * and finally, print out a message "Joined".
    */
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
-    printer.exitCode
+    (for {
+      fiber: Fiber.Runtime[Nothing, Long] <- printer.provideSomeLayer[Console with Clock](lazyLayer).fork
+      _                                   <- putStrLn("Forked")
+      _                                   <- fiber.join
+      _                                   <- putStrLn("Joined")
+    } yield ()).exitCode
 }
 
 object ForkInterrupt extends App {
   import zio.console._
   import zio.duration._
 
-  val infinitePrinter =
+  val infinitePrinter: ZIO[Console, Nothing, Nothing] =
     putStrLn(".").forever
 
   /**
@@ -35,7 +77,13 @@ object ForkInterrupt extends App {
    * finally, print out a message "Interrupted".
    */
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
-    (infinitePrinter *> ZIO.sleep(10.millis)).exitCode
+    (for {
+      fiber <- infinitePrinter.fork
+      _     <- putStrLn("Forked")
+      _     <- ZIO.sleep(100.millis)
+      _     <- fiber.interrupt
+      _     <- putStrLn("Interrupted")
+    } yield ()).exitCode
 }
 
 object ParallelFib extends App {
@@ -47,22 +95,25 @@ object ParallelFib extends App {
    * Rewrite this implementation to compute nth fibonacci number in parallel.
    */
   def fib(n: Int): UIO[BigInt] = {
-    def loop(n: Int, original: Int): UIO[BigInt] =
-      if (n <= 1) UIO(n)
-      else
-        UIO.effectSuspendTotal {
-          (loop(n - 1, original) zipWith loop(n - 2, original))(_ + _)
-        }
-
-    loop(n, n)
+    val base: Seq[Fiber.Synthetic[Nothing, BigInt]] = Seq(Fiber.done(Exit.succeed(0)), Fiber.done(Exit.succeed(1)))
+    val fibers: ZIO[Any, Nothing, Seq[Fiber.Synthetic[Nothing, BigInt]]] =
+      ZIO.iterate(base)(_.size <= n) { fibers =>
+        val newFiber: Fiber.Synthetic[Nothing, BigInt] =
+          fibers(fibers.size - 2).zipWith(fibers(fibers.size - 1))(_ + _).map { num =>
+            println(s"Generated $num")
+            num
+          }
+        val newFibers: Seq[Fiber.Synthetic[Nothing, BigInt]] = fibers :+ newFiber
+        ZIO.succeed(newFibers)
+      }
+    fibers.flatMap(_.last.join)
   }
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
     for {
-      _ <- putStrLn(
+      n <- (putStrLn(
             "What number of the fibonacci sequence should we calculate?"
-          )
-      n <- getStrLn.orDie.flatMap(input => ZIO(input.toInt)).eventually
+          ) *> getStrLn.mapEffect(_.toInt)).eventually
       f <- fib(n)
       _ <- putStrLn(s"fib(${n}) = ${f}")
     } yield ExitCode.success
@@ -100,7 +151,13 @@ object AlarmAppImproved extends App {
    * prints out a wakeup alarm message, like "Time to wakeup!!!".
    */
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
-    ???
+    (for {
+      seconds <- getAlarmDuration
+      fiber   <- (putStrLn(".") *> ZIO.sleep(1.second)).forever.fork
+      _       <- ZIO.sleep(seconds)
+      _       <- fiber.interrupt
+      _       <- putStrLn("Time to wake up!!!")
+    } yield ()).exitCode
 }
 
 /**
@@ -149,7 +206,20 @@ object ComputePi extends App {
    * ongoing estimates continuously until the estimation is complete.
    */
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
-    ???
+    (for {
+      insides: Ref[Long] <- Ref.make(0L)
+      total: Ref[Long]   <- Ref.make(0L)
+      generator <- randomPoint.flatMap {
+                    case (x, y) =>
+                      ZIO.when(insideCircle(x, y))(insides.update(_ + 1)) *>
+                        total.update(_ + 1)
+                  }.forever.fork
+      eff = insides.get.zipWith(total.get)(estimatePi)
+      _ <- eff
+            .tap(estimation => putStrLn(s"Estimation: $estimation"))
+            .repeatUntil(estimation => Math.abs(estimation - 3.1416) <= 0.001)
+      _ <- generator.interrupt
+    } yield ()).exitCode
 }
 
 object ParallelZip extends App {
@@ -206,7 +276,24 @@ object StmSwap extends App {
    *
    * Using `STM`, implement a safe version of the swap function.
    */
-  def exampleStm: UIO[Int] = ???
+  def exampleStm: UIO[Int] = {
+    def swap[A](ref1: TRef[A], ref2: TRef[A]): UIO[Unit] =
+      (for {
+        v1 <- ref1.get
+        v2 <- ref2.get
+        _ <- ref1.set(v2)
+        _ <- ref2.set(v1)
+      } yield ()).commit
+
+    for {
+      ref1   <- TRef.makeCommit(100)
+      ref2   <- TRef.make(0).commit
+      fiber1 <- swap(ref1, ref2).repeatN(100).fork
+      fiber2 <- swap(ref2, ref1).repeatN(100).fork
+      _      <- (fiber1 zip fiber2).join
+      value  <- (ref1.get zipWith ref2.get)(_ + _).commit
+    } yield value
+  }
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
     exampleRef.map(_.toString).flatMap(putStrLn(_)).exitCode
@@ -223,24 +310,39 @@ object StmLock extends App {
    * acquisition, and release methods.
    */
   class Lock private (tref: TRef[Boolean]) {
-    def acquire: UIO[Unit] = ???
-    def release: UIO[Unit] = ???
+    def acquire: UIO[Unit] = (for {
+      //      free <- tref.get
+      //      _ <- if(free) ZSTM.unit else ZSTM.retry
+
+      //      free <- tref.get
+      //      _ <- ZSTM.when(!free)(ZSTM.retry)
+
+      _ <- tref.get.retryUntil(identity)
+
+      _ <- tref.set(false)
+    } yield ()).commit
+
+    def release: UIO[Unit] = (for {
+      _ <- tref.get.retryWhile(identity)
+      _ <- tref.set(true)
+    } yield ()).commit
   }
   object Lock {
-    def make: UIO[Lock] = ???
+    def make: UIO[Lock] =
+      TRef.makeCommit(true).map(tref => new Lock(tref))
   }
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
     for {
       lock <- Lock.make
       fiber1 <- lock.acquire
-                 .bracket_(lock.release)(putStrLn("Bob  : I have the lock!"))
-                 .repeat(Schedule.recurs(10))
-                 .fork
+                 .bracket_(lock.release)(
+                   putStrLn("Bob: I have the lock!").repeat(Schedule.recurs(10))
+                 ).fork
       fiber2 <- lock.acquire
-                 .bracket_(lock.release)(putStrLn("Sarah: I have the lock!"))
-                 .repeat(Schedule.recurs(10))
-                 .fork
+                 .bracket_(lock.release)(
+                   putStrLn("Sarah: I have the lock!").repeat(Schedule.recurs(10))
+                 ).fork
       _ <- (fiber1 zip fiber2).join
     } yield ExitCode.success
 }
@@ -249,6 +351,7 @@ object StmQueue extends App {
   import zio.console._
   import zio.stm._
   import scala.collection.immutable.{ Queue => ScalaQueue }
+  import zio.duration.durationInt
 
   /**
    * EXERCISE
@@ -256,26 +359,38 @@ object StmQueue extends App {
    * Using STM, implement a async queue with double back-pressuring.
    */
   class Queue[A] private (capacity: Int, queue: TRef[ScalaQueue[A]]) {
-    def take: UIO[A]           = ???
-    def offer(a: A): UIO[Unit] = ???
+    def take: UIO[A]           = (for {
+      scalaQueue: ScalaQueue[A] <- queue.get.retryUntil(_.size > 0)
+      element <- queue.modify(_.dequeue)
+    } yield element).commit
+
+    def offer(a: A): UIO[Unit] = (for {
+      scalaQueue: ScalaQueue[A] <- queue.get.retryUntil(_.size < capacity)
+      _ <- queue.set(scalaQueue.enqueue(a))
+    } yield ()
+    ).commit
   }
   object Queue {
-    def bounded[A](capacity: Int): UIO[Queue[A]] = ???
+    def bounded[A](capacity: Int): UIO[Queue[A]] =
+      TRef.makeCommit(ScalaQueue.empty[A]).map { tref =>
+        new Queue(capacity, tref)
+      }
   }
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
     for {
       queue <- Queue.bounded[Int](10)
-      _     <- ZIO.foreach(0 to 100)(i => queue.offer(i)).fork
-      _ <- ZIO.foreach(0 to 100)(
-            _ => queue.take.flatMap(i => putStrLn(s"Got: ${i}"))
-          )
+      _     <- putStrLn("Starting program")
+      _     <- ZIO.foreach(0 to 100)(i =>  putStrLn(s"Enqueuing $i") *> queue.offer(i) <* putStrLn(s"Enqueued $i")).fork
+      _     <- ZIO.sleep(3.seconds)
+      _     <- ZIO.foreach(0 to 100)(_ => queue.take.flatMap(i => putStrLn(s"Got: ${i}")))
     } yield ExitCode.success
 }
 
 object StmLunchTime extends App {
   import zio.console._
   import zio.stm._
+  import zio.duration.durationInt
 
   /**
    * EXERCISE
@@ -285,10 +400,15 @@ object StmLunchTime extends App {
   final case class Attendee(state: TRef[Attendee.State]) {
     import Attendee.State._
 
-    def isStarving: STM[Nothing, Boolean] = ???
+    def isStarving: STM[Nothing, Boolean] =
+      state.get.map(_ == Starving)
 
-    def feed: STM[Nothing, Unit] = ???
+    def feed: STM[Nothing, Unit] = for {
+      _ <- state.get.retryUntil(_ == Starving)
+      _ <- state.set(Full)
+    } yield ()
   }
+
   object Attendee {
     sealed trait State
     object State {
@@ -306,15 +426,22 @@ object StmLunchTime extends App {
     def findEmptySeat: STM[Nothing, Option[Int]] =
       seats
         .fold[(Int, Option[Int])]((0, None)) {
-          case ((index, z @ Some(_)), _) => (index + 1, z)
+          case ((index, z @ Some(_)), _) =>
+            (index + 1, z)
           case ((index, None), taken) =>
             (index + 1, if (taken) None else Some(index))
         }
         .map(_._2)
 
-    def takeSeat(index: Int): STM[Nothing, Unit] = ???
+    def takeSeat(index: Int): STM[Nothing, Unit] = for {
+      _ <- seats(index).retryWhile(identity)
+      _ <- seats.update(index, _ => true)
+    } yield ()
 
-    def vacateSeat(index: Int): STM[Nothing, Unit] = ???
+    def vacateSeat(index: Int): STM[Nothing, Unit] = for {
+      _ <- seats(index).retryUntil(identity)
+      _ <- seats.update(index, _ => false)
+    } yield ()
   }
 
   /**
@@ -322,27 +449,35 @@ object StmLunchTime extends App {
    *
    * Using STM, implement a method that feeds a single attendee.
    */
-  def feedAttendee(t: Table, a: Attendee): STM[Nothing, Unit] = ???
+  def feedAttendee(t: Table, a: Attendee): URIO[Console with Clock, Unit] = for {
+    seat <- t.findEmptySeat.retryUntil(_.isDefined).map(_.get).tap { seat => t.takeSeat(seat)}.commit
+    _ <- putStrLn(s"Taking seat $seat")
+    _ <- ZIO.sleep(1.second)
+    _ <- a.feed.commit
+    _ <- t.vacateSeat(seat).commit
+    _ <- putStrLn(s"Vacating seat $seat")
+  } yield ()
 
   /**
    * EXERCISE
    *
    * Using STM, implement a method that feeds only the starving attendees.
    */
-  def feedStarving(table: Table, attendees: Iterable[Attendee]): UIO[Unit] =
-    ???
+  def feedStarving(table: Table, attendees: Iterable[Attendee]): URIO[Clock with Console, Unit] =
+    ZIO.foreachPar(attendees)(attendee =>
+      feedAttendee(table, attendee)
+    ).unit
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] = {
     val Attendees = 100
     val TableSize = 5
 
     for {
-      attendees <- ZIO.foreach(0 to Attendees)(
-                    i =>
-                      TRef
-                        .make[Attendee.State](Attendee.State.Starving)
-                        .map(Attendee(_))
-                        .commit
+      attendees <- ZIO.foreach(0 to Attendees)(i =>
+                    TRef
+                      .make[Attendee.State](Attendee.State.Starving)
+                      .map(Attendee(_))
+                      .commit
                   )
       table <- TArray
                 .fromIterable(List.fill(TableSize)(false))
@@ -364,16 +499,39 @@ object StmPriorityQueue extends App {
    * Using STM, design a priority queue, where smaller integers are assumed
    * to have higher priority than greater integers.
    */
+
   class PriorityQueue[A] private (
     minLevel: TRef[Option[Int]],
     map: TMap[Int, TQueue[A]]
   ) {
-    def offer(a: A, priority: Int): STM[Nothing, Unit] = ???
+    def offer(a: A, priority: Int): STM[Nothing, Unit] = for {
+      maybeQueue: Option[TQueue[A]] <- map.get(priority)
+      queue: TQueue[A] <- maybeQueue match {
+        case Some(queue) => STM.succeed(queue)
+        case None => TQueue.unbounded[A].tap(map.put(priority, _))
+      }
+      () <- queue.offer(a)
+      () <- setMinLevel
+    } yield ()
 
-    def take: STM[Nothing, A] = ???
+    private def setMinLevel: STM[Nothing, Unit] = for {
+      maybeMinLevel <- map.keys.map(_.sorted.headOption)
+      () <- minLevel.set(maybeMinLevel)
+    } yield ()
+
+    def take: STM[Nothing, A] = for {
+      Some(minLevel) <- minLevel.get.retryWhile(_.isEmpty)
+      Some(queue) <- map.get(minLevel)
+      element <- queue.take
+      isEmpty <- queue.isEmpty
+      () <- STM.when(isEmpty)(map.delete(minLevel) *> setMinLevel)
+    } yield element
   }
   object PriorityQueue {
-    def make[A]: STM[Nothing, PriorityQueue[A]] = ???
+    def make[A]: STM[Nothing, PriorityQueue[A]] =  for {
+      minLevel <- TRef.make(Option.empty[Int])
+      map <- TMap.empty[Int, TQueue[A]]
+    } yield new PriorityQueue[A](minLevel, map)
   }
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
@@ -381,16 +539,17 @@ object StmPriorityQueue extends App {
       _     <- putStrLn("Enter any key to exit...")
       queue <- PriorityQueue.make[String].commit
       lowPriority = ZIO.foreach(0 to 100) { i =>
-        ZIO.sleep(1.millis) *> queue
+        queue
           .offer(s"Offer: ${i} with priority 3", 3)
           .commit
       }
       highPriority = ZIO.foreach(0 to 100) { i =>
-        ZIO.sleep(2.millis) *> queue
+        queue
           .offer(s"Offer: ${i} with priority 0", 0)
           .commit
       }
-      _ <- ZIO.forkAll(List(lowPriority, highPriority)) *> queue.take.commit
+      _ <- ZIO.collectAllPar(List(lowPriority, highPriority)) *>
+          queue.take.commit
             .flatMap(putStrLn(_))
             .forever
             .fork *>
@@ -402,12 +561,12 @@ object StmReentrantLock extends App {
   import zio.console._
   import zio.stm._
 
-  private final case class WriteLock(
+  case class WriteLock(
     writeCount: Int,
     readCount: Int,
     fiberId: Fiber.Id
   )
-  private final class ReadLock private (readers: Map[Fiber.Id, Int]) {
+  class ReadLock private (readers: Map[Fiber.Id, Int]) {
     def total: Int = readers.values.sum
 
     def noOtherHolder(fiberId: Fiber.Id): Boolean =
@@ -441,20 +600,54 @@ object StmReentrantLock extends App {
    * Using STM, implement a reentrant read/write lock.
    */
   class ReentrantReadWriteLock(data: TRef[Either[ReadLock, WriteLock]]) {
-    def writeLocks: UIO[Int] = ???
+    type State = Either[ReadLock, WriteLock]
+    def writeLocks: State => Int = state => state.fold(_ => 0, _.writeCount)
 
-    def writeLocked: UIO[Boolean] = ???
+    def writeLocked: State => Boolean = state => state.fold(_ => false, _.writeCount > 0)
 
-    def readLocks: UIO[Int] = ???
+    def readLocks: State => Int = state => state.fold(_.total, _.readCount)
 
-    def readLocked: UIO[Boolean] = ???
+    def readLocked: State => Boolean = state => state.fold(_.total > 0, _.readCount > 0)
 
-    val read: Managed[Nothing, Int] = ???
+    val read: Managed[Nothing, Int] = Managed.make {
+      (for {
+        fiberId <- ZSTM.fiberId
+        _ <- data.get.map(writeLocked).retryWhile(identity)
+        readCount <- data.updateAndGet(_.fold(rl => Left(rl.adjust(fiberId, 1)), Right(_))).map(readLocks)
+      } yield readCount).commit
+    }{ _ =>
+      (for {
+          fiberId <- ZSTM.fiberId
+          // TODO Make sure we are releasing in the correct state
+          // isReadLocked <- data.get.map(readLocked)
+          // () <- STM.cond(!isReadLocked, (), "Can't release read lock while not in ReadLock state")
+          _ <- data.update(_.fold(rl => Left(rl.adjust(fiberId, -1)), Right(_)))
+        } yield ()).commit
+    }
 
-    val write: Managed[Nothing, Int] = ???
+    val write: Managed[Nothing, Int] = Managed.make {
+      (for {
+        fiberId <- ZSTM.fiberId
+        _ <- data.get.map(_.fold(_.noOtherHolder(fiberId), _.fiberId == fiberId)).retryUntil(identity)
+        writeCount <- data.updateAndGet(_.fold(Left(_), wl => Right(wl.copy(writeCount = wl.writeCount + 1)))).map(writeLocks)
+      } yield writeCount).commit
+    }{ _ =>
+      (for {
+        fiberId <- ZSTM.fiberId
+        // TODO Make sure we are releasing in the correct state
+        // isWriteLocked <- data.get.map(writeLocked)
+        // _ <- STM.cond(!isWriteLocked, (), "Can't release write lock while not in WriteLock state")
+        _ <- data.update(_.fold(Left(_), wl => {
+          val newCount = wl.writeCount - 1
+          if(newCount == 0) Left(ReadLock(fiberId, wl.readCount))
+          else Right(wl.copy(writeCount = newCount))
+        } ))
+      } yield ()).commit
+    }
   }
   object ReentrantReadWriteLock {
-    def make: UIO[ReentrantReadWriteLock] = ???
+    def make: UIO[ReentrantReadWriteLock] =
+      TRef.makeCommit[Either[ReadLock, WriteLock]](Left(ReadLock.empty)).map(new ReentrantReadWriteLock(_))
   }
 
   def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] = ???
@@ -481,10 +674,35 @@ object StmDiningPhilosophers extends App {
    * both forks when they are both available.
    */
   def takeForks(
+    philosopher: Int,
     left: TRef[Option[Fork]],
     right: TRef[Option[Fork]]
   ): STM[Nothing, (Fork, Fork)] =
-    ???
+    for {
+      Some(leftFork) <- left.modify {
+        case None =>
+          println(s"$philosopher attempted to take left fork but it is taken")
+          (None, None)
+        case Some(fork) =>
+          println(s"$philosopher successfully took left fork")
+          (Some(fork), None)
+      }.retryUntil(_.isDefined)
+
+      Some(rightFork) <- right.modify {
+        case None =>
+          println(s"$philosopher attempted to take right fork but it is taken")
+          (None, None)
+        case Some(fork) =>
+          println(s"$philosopher successfully took right fork")
+          (Some(fork), None)
+      }.retryUntil(_.isDefined)
+
+//      leftFork: Fork <- left.get.repeatUntil(_.isDefined).map(_.get)
+//      _ <- left.set(None)
+//      rightFork: Fork <- right.get.repeatUntil(_.isDefined).map(_.get)
+//      _ <- right.set(None)
+
+    } yield (leftFork, rightFork)
 
   /**
    * EXERCISE
@@ -493,16 +711,21 @@ object StmDiningPhilosophers extends App {
    */
   def putForks(left: TRef[Option[Fork]], right: TRef[Option[Fork]])(
     tuple: (Fork, Fork)
-  ): STM[Nothing, Unit] = ???
+  ): STM[Nothing, Unit] = {
+    val (leftFork, rightFork) = tuple
+    for {
+      _ <- left.set(Some(leftFork))
+      _ <- right.set(Some(rightFork))
+    } yield ()
+  }
+
 
   def setupTable(size: Int): ZIO[Any, Nothing, Roundtable] = {
-    val makeFork = TRef.make[Option[Fork]](Some(Fork))
+    val makeFork: USTM[TRef[Option[Fork]]] = TRef.make[Option[Fork]](Some(Fork))
 
     (for {
-      allForks0 <- STM.foreach(0 to size) { i =>
-                    makeFork
-                  }
-      allForks = allForks0 ++ List(allForks0(0))
+      allForks0 <- STM.foreach(0 to size)(i => makeFork)
+      allForks  = allForks0 ++ List(allForks0(0))
       placements = (allForks zip allForks.drop(1)).map {
         case (l, r) => Placement(l, r)
       }
@@ -513,13 +736,13 @@ object StmDiningPhilosophers extends App {
     philosopher: Int,
     roundtable: Roundtable
   ): ZIO[Console, Nothing, Unit] = {
-    val placement = roundtable.seats(philosopher)
+    val placement: Placement = roundtable.seats(philosopher)
 
     val left  = placement.left
     val right = placement.right
 
     for {
-      forks <- takeForks(left, right).commit
+      forks <- takeForks(philosopher, left, right).commit
       _     <- putStrLn(s"Philosopher ${philosopher} eating...")
       _     <- putForks(left, right)(forks).commit
       _     <- putStrLn(s"Philosopher ${philosopher} is done eating")
@@ -530,9 +753,7 @@ object StmDiningPhilosophers extends App {
     val count = 10
 
     def eaters(table: Roundtable): Iterable[ZIO[Console, Nothing, Unit]] =
-      (0 to count).map { index =>
-        eat(index, table)
-      }
+      (0 to count).map(index => eat(index, table))
 
     for {
       table <- setupTable(count)
@@ -541,4 +762,19 @@ object StmDiningPhilosophers extends App {
       _     <- putStrLn("All philosophers have eaten!")
     } yield ExitCode.success
   }
+}
+
+object StreamExample extends App {
+  import zio._
+  import zio.console._
+  import zio.stream._
+
+  val stream = Stream
+    .fromIterable(Seq(1, 2, 3, 4, 5))
+    .mapMPar(3)(num => ZIO.sleep(zio.duration.Duration.fromMillis(5000)).map(_ => num * 10))
+    .foreach(num => putStrLn(s"${java.time.LocalDateTime.now} El nuevo numero es: ${num}"))
+
+  def run(args: List[String]): ZIO[ZEnv, Nothing, ExitCode] =
+    stream.exitCode
+
 }

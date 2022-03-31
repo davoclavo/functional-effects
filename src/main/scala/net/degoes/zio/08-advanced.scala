@@ -2,7 +2,9 @@ package net.degoes.zio
 
 import zio._
 import zio.internal.Executor
+
 import scala.concurrent.ExecutionContext
+import scala.io.Source
 
 object PoolLocking extends App {
   import zio.console._
@@ -15,7 +17,10 @@ object PoolLocking extends App {
    * Using `ZIO#lock`, write an `onDatabase` combinator that runs the
    * specified effect on the database thread pool.
    */
-  def onDatabase[R, E, A](zio: ZIO[R, E, A]): ZIO[R, E, A] = ???
+  def onDatabase[R, E, A](zio: ZIO[R, E, A]): ZIO[R, E, A] =
+    zio.lock(dbPool)
+    // ZIO.lock(dbPool)(zio)
+
 
   /**
    * EXERCISE
@@ -34,7 +39,7 @@ object PoolLocking extends App {
       println(s"Thread($id, $name, $groupName)")
     }
 
-    zio
+     log *> zio <* log
   }
 
   /**
@@ -44,15 +49,21 @@ object PoolLocking extends App {
    * determine which threads are executing which effects.
    */
   def run(args: List[String]) =
-    putStrLn("Main") *>
-      onDatabase {
-        putStrLn("Database") *>
-          blocking.blocking {
-            putStrLn("Blocking")
-          } *>
-          putStrLn("Database")
-      } *>
+    (threadLogged {
       putStrLn("Main") *>
+        onDatabase {
+          threadLogged {
+            putStrLn("Database") *>
+              blocking.blocking {
+                threadLogged {
+                  putStrLn("Blocking")
+                }
+              } *>
+              putStrLn("Database")
+          }
+        } *> putStrLn("Main")
+    } *> putStrLn(""))
+    .repeat(Schedule.recurs(10)) *>
       ZIO.succeed(ExitCode.success)
 }
 
@@ -72,23 +83,41 @@ object Sharding extends App {
     queue: Queue[A],
     n: Int,
     worker: A => ZIO[R, E, Unit]
-  ): ZIO[R, Nothing, E] = ???
+  ): ZIO[Console with R, Nothing, E] = for {
+    errorRef <- Ref.make(Option.empty[E])
+    eff: ZIO[Console with R, Nothing, Unit] = queue.take
+      .tap(n => putStrLn(s"About to process $n"))
+      .tap(worker).unit
+      .tap(n => putStrLn(s"Finished processing $n"))
+      .repeatUntilM(_ =>
+        errorRef.map(_.isDefined).get
+      )
+      .catchAll(e => errorRef.set(Some(e)))
+    fiber: Fiber[Nothing, Iterable[Unit]] <- ZIO.forkAll(ZIO.replicate(n)(eff))
+    _ <- fiber.join
+//      _ <- ZIO.collectAllPar(ZIO.replicate(n)(eff))
+//    _ <- ZIO.collectAllPar((0 to n).map(n => eff))
+    error <- errorRef.get
+  } yield error.get
 
   def run(args: List[String]) = {
-    def makeWorker(ref: Ref[Int]): Int => ZIO[Console, String, Unit] =
+    def makeWorker(semaphore: Semaphore,ref: Ref[Int]): Int => ZIO[Console, String, Unit] =
       (work: Int) =>
-        for {
-          count <- ref.get
-          _ <- if (count < 100) putStrLn(s"Worker is processing item ${work} after ${count}")
-              else ZIO.fail(s"Uh oh, failed processing ${work} after ${count}")
-          _ <- ref.update(_ + 1)
-        } yield ()
+        semaphore.withPermit(
+          for {
+            count <- ref.get
+            _ <- if (count < 100) putStrLn(s"Worker is processing item ${work} - processed so far: ${count}")
+            else ZIO.fail(s"Uh oh, failed processing ${work} after ${count}")
+            _ <- ref.update(_ + 1)
+          } yield ()
+        )
 
     for {
       queue <- Queue.bounded[Int](100)
       ref   <- Ref.make(0)
-      _     <- queue.offer(1).forever.fork
-      error <- shard(queue, 10, makeWorker(ref))
+      semaphore   <- Semaphore.make(1)
+      _     <- ZIO.collectAll((1 to 1000).map(queue.offer)).fork
+      error <- shard(queue, 10, makeWorker(semaphore, ref))
       _     <- putStrLn(s"Failed with ${error}")
     } yield ExitCode.success
   }
@@ -112,7 +141,16 @@ object parallel_web_crawler {
      * Implement a layer for `Web` that uses the `effectBlockingIO` combinator
      * to safely wrap `Source.fromURL` into a functional effect.
      */
-    val live: ZLayer[Blocking, Nothing, Web] = ???
+    val live: ZLayer[Blocking, Nothing, Web] =
+      ???
+//      new Service {
+//        override def getURL(url: URL): IO[Exception, String] =
+//          effectBlockingIO(
+//            Source.fromURL(url)
+//          )
+//      }
+
+
   }
 
   /**
